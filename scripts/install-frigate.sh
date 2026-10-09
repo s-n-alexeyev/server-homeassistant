@@ -108,49 +108,55 @@ for c in lvdisplay blkid mkfs.ext4 mount findmnt docker ffprobe nmap wget; do
   need_cmd "$c"
 done
 
-# === 4. LVM + ФАЙЛОВАЯ СИСТЕМА + МОНТИРОВАНИЕ (АВТОМАТИЧЕСКАЯ ОЧИСТКА ДУБЛИКАТОВ) ===
-echo "=== Автоматическая проверка и очистка дубликатов LVM и fstab ==="
+# === 4. LVM + ФАЙЛОВАЯ СИСТЕМА + МОНТИРОВАНИЕ ===
+echo "=== Настройка хранилища LVM ==="
 
-# Отмонтируем точку, если она была занята
-umount -lf "$MOUNTPOINT" 2>/dev/null || true
-
-# Автоматически удаляем все старые/лишние логические тома Frigate (например, дубликаты)
+# Очищаем старые/лишние дубликаты томов перед проверкой
 for old_lv in $(lvs --noheadings -o lv_name "$VG_NAME" 2>/dev/null | grep -E "frigate-storage" | grep -v "$LV_NAME"); do
-  echo "⚠️ Найден лишний том LVM: $old_lv. Принудительно удаляем..."
+  echo "⚠️ Обнаружен лишний том: $old_lv. Удаляем..."
+  umount -lf "$MOUNTPOINT" 2>/dev/null || true
   lvremove -f "$VG_NAME/$old_lv" || true
 done
 
-# Очищаем все старые записи для /opt/frigate/storage в fstab
-if grep -q "$MOUNTPOINT" /etc/fstab; then
-  echo "ℹ️ Очищаем старые записи монтирования в /etc/fstab..."
-  grep -v "$MOUNTPOINT" /etc/fstab > /etc/fstab.tmp && mv /etc/fstab.tmp /etc/fstab
-fi
-
-# Проверяем основной том
 if lvdisplay "$LV_PATH" >/dev/null 2>&1; then
-  echo "✔ Основной том $LV_NAME уже существует."
-  # Если нужен авто-апдейт размера, можно раскомментировать строку ниже, 
-  # но сейчас оставляем как есть, без лишних вопросов:
-  # lvextend -L +50G -r "$LV_PATH" 2>/dev/null || true
+  echo "✔ Том $LV_NAME уже существует."
+  lvdisplay "$LV_PATH" | grep -E "LV Size"
+
+  read -rp "Хотите изменить размер существующего тома? [y/N]: " resize_choice
+  resize_choice="${resize_choice:-N}"
+  if [[ "$resize_choice" =~ ^[Yy]$ ]]; then
+    read -rp "Введите новый размер тома (например, 150G, +50G): " NEW_SIZE
+    if [ -n "$NEW_SIZE" ]; then
+      echo "Изменяю размер LV до $NEW_SIZE..."
+      lvextend -L "$NEW_SIZE" -r "$LV_PATH" || lvreduce -L "$NEW_SIZE" -r "$LV_PATH"
+    fi
+  fi
 else
   read -rp "Введите объем создаваемого тома (по умолчанию 100G): " INPUT_SIZE
   SIZE="${INPUT_SIZE:-100G}"
-  echo "Создаю LV $LV_NAME с размером $SIZE..."
+  echo "Используемый размер тома: $SIZE"
+
+  echo "Создаю LV $LV_NAME..."
   lvcreate -V "$SIZE" -T "$VG_NAME/$THIN_POOL" -n "$LV_NAME"
 fi
 
 if ! blkid "$LV_PATH" >/dev/null 2>&1; then
-  echo "Создаю файловую систему ext4..."
+  echo "Создаю ext4..."
   mkfs.ext4 "$LV_PATH"
 fi
 
 mkdir -p "$MOUNTPOINT"
 UUID=$(blkid -s UUID -o value "$LV_PATH")
 
-# Прописываем единственную правильную запись в fstab
+# Очищаем fstab от старых записей и записываем актуальную
+if grep -q "$MOUNTPOINT" /etc/fstab; then
+  grep -v "$MOUNTPOINT" /etc/fstab > /etc/fstab.tmp && mv /etc/fstab.tmp /etc/fstab
+fi
 echo "UUID=$UUID $MOUNTPOINT ext4 defaults,nofail 0 2" >> /etc/fstab
 
-mount "$MOUNTPOINT"
+if ! mountpoint -q "$MOUNTPOINT"; then
+  mount "$MOUNTPOINT" || true
+fi
 
 echo "✔ Storage ready:"
 findmnt "$MOUNTPOINT" || true
@@ -165,16 +171,25 @@ if [[ "$CPU_VENDOR" == "AuthenticAMD" ]]; then
     MODEL_PATH="$AMD_MODEL_CACHE/yolov8s_320x320.onnx"
 
     if [ ! -f "$MODEL_PATH" ]; then
-        echo "⬇ Скачиваю архив с моделями YOLOv8 для ROCm..."
+        echo "⬇ Скачиваю архив с моделями YOLOv8 для ROCm (harakas/models)..."
         TMP_TAR=$(mktemp /tmp/yolov8_models.XXXXXX.tar.gz)
         if ! wget -q --show-progress -O "$TMP_TAR" \
             "https://github.com/harakas/models/releases/download/yolov8.1-1.1/yolov8.small.models.tar.gz"; then
-            echo "⚠️ Не удалось скачать архив вручную. Frigate скачает его сам."
+            echo "⚠️ Не удалось скачать архив вручную."
+            echo "   Frigate попробует скачать модель сам при старте (DOWNLOAD_YOLOV8=1)."
             rm -f "$TMP_TAR"
         else
             echo "📦 Распаковываю архив..."
             tar -xzf "$TMP_TAR" -C "$AMD_MODEL_CACHE"
             rm -f "$TMP_TAR"
+
+            if [ -f "$MODEL_PATH" ]; then
+                echo "✔ Модель готова: $MODEL_PATH"
+                ls -lh "$AMD_MODEL_CACHE"/labels*.txt 2>/dev/null || true
+            else
+                echo "⚠️ Файл yolov8s_320x320.onnx не найден после распаковки."
+                echo "   Frigate попробует скачать модель сам при старте."
+            fi
         fi
     else
         echo "✔ Модель уже существует: $MODEL_PATH"
@@ -399,7 +414,7 @@ ${COMPOSE_DEVICES}
     volumes:
       - /etc/localtime:/etc/localtime:ro
       - ./config:/config
-      - ${MOUNTPOINT}:/media/frigate
+      - ./storage:/media/frigate
     ports:
       - "8971:8971"
       - "5000:5000"
@@ -415,5 +430,6 @@ echo "=== Запуск Docker Compose ==="
 docker compose down || true
 docker compose up -d
 echo "✔ ГОТОВО! Используемый образ: $FRIGATE_IMAGE"
-echo "Хранилище подключено из LVM напрямую: ${MOUNTPOINT} -> /media/frigate"
 echo "UI: http://<server>:5000"
+echo
+echo "Проверьте логи:  docker logs -f frigate"
