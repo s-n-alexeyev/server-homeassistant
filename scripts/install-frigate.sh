@@ -50,7 +50,6 @@ if [[ "$CPU_VENDOR" == "AuthenticAMD" ]]; then
       - /dev/dri:/dev/dri
       - /dev/kfd:/dev/kfd"
 
-    # Frigate 0.18: ROCm работает внутри ONNX-детектора через device: ROCM
     DETECTORS_BLOCK="detectors:
   onnx:
     type: onnx
@@ -66,10 +65,6 @@ if [[ "$CPU_VENDOR" == "AuthenticAMD" ]]; then
   input_pixel_format: bgr
   input_dtype: float"
 
-    # HSA_OVERRIDE_GFX_VERSION: 11.0.0 — RDNA2 (RX 6000, iGPU Ryzen 6000)
-    # RDNA3 (RX 7000, iGPU Ryzen 7000/8000) → 11.0.2
-    # RDNA1 (RX 5000) → 10.1.0
-    # Vega (iGPU Ryzen 2000/3000, RX Vega) → 9.0.0
     EXTRA_ENV="      DOWNLOAD_YOLOV8: \"1\"
       HSA_OVERRIDE_GFX_VERSION: \"11.0.0\"
       LIBVA_DRIVER_NAME: \"radeonsi\""
@@ -109,48 +104,45 @@ need_cmd() {
 }
 
 echo "=== Проверка зависимостей ==="
-for c in lvcreate lvdisplay blkid mkfs.ext4 mount findmnt docker ffprobe nmap wget; do
+for c in lvdisplay blkid mkfs.ext4 mount findmnt docker ffprobe nmap wget; do
   need_cmd "$c"
 done
 
-# === 4. LVM + ФАЙЛОВАЯ СИСТЕМА + МОНТИРОВАНИЕ ===
-echo "=== Настройка хранилища LVM ==="
-if lvdisplay "$LV_PATH" >/dev/null 2>&1; then
-  echo "✔ Том $LV_NAME уже существует."
-  lvdisplay "$LV_PATH" | grep -E "LV Size"
+# === 4. LVM + ФАЙЛОВАЯ СИСТЕМА + МОНТИРОВАНИЕ (АВТООЧИСТКА ДУБЛИКАТОВ) ===
+echo "=== Проверка и очистка старых томов LVM ==="
 
-  read -rp "Хотите изменить размер существующего тома? [y/N]: " resize_choice
-  resize_choice="${resize_choice:-N}"
-  if [[ "$resize_choice" =~ ^[Yy]$ ]]; then
-    read -rp "Введите новый размер тома (например, 150G, +50G): " NEW_SIZE
-    if [ -n "$NEW_SIZE" ]; then
-      echo "Изменяю размер LV до $NEW_SIZE..."
-      lvextend -L "$NEW_SIZE" -r "$LV_PATH" || lvreduce -L "$NEW_SIZE" -r "$LV_PATH"
-    fi
-  fi
+for old_lv in $(lvs --noheadings -o lv_name $VG_NAME 2>/dev/null | grep -E "frigate-storage" | grep -v "$LV_NAME"); do
+  echo "⚠️ Обнаружен лишний том: $old_lv. Удаляем..."
+  umount -lf "$MOUNTPOINT" 2>/dev/null || true
+  lvremove -f "$VG_NAME/$old_lv" || true
+done
+
+if grep -q "$MOUNTPOINT" /etc/fstab; then
+  echo "ℹ️ Очищаем старые записи монтирования в /etc/fstab..."
+  grep -v "$MOUNTPOINT" /etc/fstab > /etc/fstab.tmp && mv /etc/fstab.tmp /etc/fstab
+fi
+
+if lvdisplay "$LV_PATH" >/dev/null 2>&1; then
+  echo "✔ Актуальный том $LV_NAME уже существует."
 else
   read -rp "Введите объем создаваемого тома (по умолчанию 100G): " INPUT_SIZE
   SIZE="${INPUT_SIZE:-100G}"
-  echo "Используемый размер тома: $SIZE"
-
-  echo "Создаю LV $LV_NAME..."
+  echo "Создаю LV $LV_NAME с размером $SIZE..."
   lvcreate -V "$SIZE" -T "$VG_NAME/$THIN_POOL" -n "$LV_NAME"
 fi
 
 if ! blkid "$LV_PATH" >/dev/null 2>&1; then
-  echo "Создаю ext4..."
+  echo "Создаю файловую систему ext4..."
   mkfs.ext4 "$LV_PATH"
 fi
 
 mkdir -p "$MOUNTPOINT"
 UUID=$(blkid -s UUID -o value "$LV_PATH")
-if ! grep -q "$UUID" /etc/fstab; then
-  echo "UUID=$UUID $MOUNTPOINT ext4 defaults,nofail 0 2" >> /etc/fstab
-fi
 
-if ! mountpoint -q "$MOUNTPOINT"; then
-  mount "$MOUNTPOINT" || true
-fi
+echo "UUID=$UUID $MOUNTPOINT ext4 defaults,nofail 0 2" >> /etc/fstab
+
+umount "$MOUNTPOINT" 2>/dev/null || true
+mount "$MOUNTPOINT"
 
 echo "✔ Storage ready:"
 findmnt "$MOUNTPOINT" || true
@@ -159,39 +151,28 @@ df -h "$MOUNTPOINT" || true
 # === 5. СКАНИРОВАНИЕ СЕТИ И ГЕНЕРАЦИЯ КОНФИГА ===
 mkdir -p "$CONFIG_DIR"
 
-# --- Предзагрузка модели YOLOv8 для AMD ROCm (проверенный источник) ---
 if [[ "$CPU_VENDOR" == "AuthenticAMD" ]]; then
     AMD_MODEL_CACHE="$CONFIG_DIR/model_cache/yolov8"
     mkdir -p "$AMD_MODEL_CACHE"
     MODEL_PATH="$AMD_MODEL_CACHE/yolov8s_320x320.onnx"
 
     if [ ! -f "$MODEL_PATH" ]; then
-        echo "⬇ Скачиваю архив с моделями YOLOv8 для ROCm (harakas/models)..."
+        echo "⬇ Скачиваю архив с моделями YOLOv8 для ROCm..."
         TMP_TAR=$(mktemp /tmp/yolov8_models.XXXXXX.tar.gz)
         if ! wget -q --show-progress -O "$TMP_TAR" \
             "https://github.com/harakas/models/releases/download/yolov8.1-1.1/yolov8.small.models.tar.gz"; then
-            echo "⚠️ Не удалось скачать архив вручную."
-            echo "   Frigate попробует скачать модель сам при старте (DOWNLOAD_YOLOV8=1)."
+            echo "⚠️ Не удалось скачать архив вручную. Frigate скачает его сам."
             rm -f "$TMP_TAR"
         else
             echo "📦 Распаковываю архив..."
             tar -xzf "$TMP_TAR" -C "$AMD_MODEL_CACHE"
             rm -f "$TMP_TAR"
-
-            if [ -f "$MODEL_PATH" ]; then
-                echo "✔ Модель готова: $MODEL_PATH"
-                ls -lh "$AMD_MODEL_CACHE"/labels*.txt 2>/dev/null || true
-            else
-                echo "⚠️ Файл yolov8s_320x320.onnx не найден после распаковки."
-                echo "   Frigate попробует скачать модель сам при старте."
-            fi
         fi
     else
         echo "✔ Модель уже существует: $MODEL_PATH"
     fi
 fi
 
-# --- Вспомогательные функции ---
 scan_subnet() {
     local subnet="$1"
     nmap -p 554 --open -oG - "$subnet" 2>/dev/null | grep "554/open" | awk '{print $2}'
@@ -243,7 +224,6 @@ EOF
   fi
 }
 
-# --- Обработка одной камеры по IP (используется во всех режимах) ---
 configure_camera_by_ip() {
     local ip="$1"
 
@@ -265,7 +245,6 @@ configure_camera_by_ip() {
     read -rsp "Пароль: " CAM_PASS
     echo
 
-    # ONVIF-порты
     local ONVIF_FOUND_PORT=""
     for p in 80 8000 8899; do
         if probe_onvif "$ip" "$p"; then
@@ -274,7 +253,6 @@ configure_camera_by_ip() {
         fi
     done
 
-    # Поиск рабочего RTSP
     local RTSP_FOUND=""
     for cred_pair in "${CAM_USER}:${CAM_PASS}" " : " "admin:admin" "root:root"; do
         local u p
@@ -288,7 +266,6 @@ configure_camera_by_ip() {
     done
     [ -z "$RTSP_FOUND" ] && RTSP_FOUND="rtsp://${CAM_USER:+$CAM_USER${CAM_PASS:+:$CAM_PASS}@}${ip}:554/ch0"
 
-    # Выбор протокола
     local PROTOCOL_CHOICE="rtsp"
     if [ -n "$ONVIF_FOUND_PORT" ] && [ -n "$RTSP_FOUND" ]; then
         local proto_input
@@ -350,8 +327,8 @@ EOF
     camera_index=$((camera_index+1))
 }
 
-# --- Шапка конфига ---
-cat > "$CONFIG_FILE" <<EOF
+if [ ! -f "$CONFIG_FILE" ]; then
+    cat > "$CONFIG_FILE" <<EOF
 mqtt:
   enabled: false
 ${DETECTORS_BLOCK}
@@ -369,80 +346,36 @@ record:
 cameras:
 EOF
 
-# --- Первичное сканирование сети ---
-discovered_ips=()
-if command -v nmap >/dev/null 2>&1; then
-    read -rp "Запустить сканирование сети для поиска камер? [Y/n]: " scan_choice
-    scan_choice="${scan_choice:-Y}"
-    if [[ "$scan_choice" =~ ^[Yy]$ ]]; then
-        echo "=== Сканирование сети ==="
-        mapfile -t discovered_ips < <(scan_network)
-        if [ ${#discovered_ips[@]} -gt 0 ]; then
-            echo "✔ Найдены IP с открытым портом 554: ${discovered_ips[*]}"
-        else
-            echo "⚠️ Устройств с открытым портом 554 не найдено."
+    discovered_ips=()
+    if command -v nmap >/dev/null 2>&1; then
+        read -rp "Запустить сканирование сети для поиска камер? [Y/n]: " scan_choice
+        scan_choice="${scan_choice:-Y}"
+        if [[ "$scan_choice" =~ ^[Yy]$ ]]; then
+            echo "=== Сканирование сети ==="
+            mapfile -t discovered_ips < <(scan_network)
         fi
     fi
-fi
 
-# --- Обработка камер ---
-camera_index=1
-
-if [ ${#discovered_ips[@]} -gt 0 ]; then
-    echo "=== Настройка найденных камер ==="
-    for ip in "${discovered_ips[@]}"; do
-        configure_camera_by_ip "$ip"
-    done
+    camera_index=1
+    if [ ${#discovered_ips[@]} -gt 0 ]; then
+        for ip in "${discovered_ips[@]}"; do
+            configure_camera_by_ip "$ip"
+        done
+    else
+        read -rp "Количество камер: " CAMERA_COUNT
+        if [[ "$CAMERA_COUNT" =~ ^[0-9]+$ ]] && [ "$CAMERA_COUNT" -gt 0 ]; then
+            i=1
+            while [ "$i" -le "$CAMERA_COUNT" ]; do
+              read -rp "IP камеры $i: " CAM_IP
+              [ -n "$CAM_IP" ] && configure_camera_by_ip "$CAM_IP"
+              i=$((i+1))
+            done
+        fi
+    fi
+    echo "version: 0.18" >> "$CONFIG_FILE"
 else
-    read -rp "Количество камер: " CAMERA_COUNT
-    if ! [[ "$CAMERA_COUNT" =~ ^[0-9]+$ ]] || [ "$CAMERA_COUNT" -le 0 ]; then
-      echo "Нужно минимум 1 камера"
-      exit 1
-    fi
-
-    i=1
-    while [ "$i" -le "$CAMERA_COUNT" ]; do
-      echo; echo "=== Камера $i ==="
-      read -rp "IP: " CAM_IP
-      if [ -z "$CAM_IP" ]; then
-          echo "❌ пропуск (нет IP)"
-          i=$((i+1))
-          continue
-      fi
-      configure_camera_by_ip "$CAM_IP"
-      i=$((i+1))
-    done
+    echo "✔ Файл конфигурации уже существует, пропускаем генерацию камер."
 fi
-
-# --- Цикл поиска камер в дополнительных сетях ---
-while true; do
-    echo
-    read -rp "Поискать камеры в другой сети? [y/N]: " more_networks
-    more_networks="${more_networks:-N}"
-    [[ "$more_networks" =~ ^[Yy]$ ]] || break
-
-    read -rp "Введите подсеть (например, 192.168.20.0/24): " user_subnet
-    if [ -z "$user_subnet" ]; then
-        echo "⚠️ Подсеть не указана, пропускаю."
-        continue
-    fi
-
-    echo "=== Сканирование $user_subnet ==="
-    more_ips=()
-    mapfile -t more_ips < <(scan_subnet "$user_subnet")
-    if [ ${#more_ips[@]} -eq 0 ]; then
-        echo "⚠️ Устройств с открытым портом 554 не найдено в $user_subnet."
-        continue
-    fi
-
-    echo "✔ Найдены IP: ${more_ips[*]}"
-    for ip in "${more_ips[@]}"; do
-        configure_camera_by_ip "$ip"
-    done
-done
-
-echo "version: 0.18" >> "$CONFIG_FILE"
-echo "✔ Config ready"
 
 # === 6. СОЗДАНИЕ DOCKER COMPOSE И ЗАПУСК ===
 mkdir -p "$BASE"; cd "$BASE"
@@ -458,7 +391,7 @@ ${COMPOSE_DEVICES}
     volumes:
       - /etc/localtime:/etc/localtime:ro
       - ./config:/config
-      - ./storage:/media/frigate
+      - ${MOUNTPOINT}:/media/frigate
     ports:
       - "8971:8971"
       - "5000:5000"
@@ -474,6 +407,5 @@ echo "=== Запуск Docker Compose ==="
 docker compose down || true
 docker compose up -d
 echo "✔ ГОТОВО! Используемый образ: $FRIGATE_IMAGE"
+echo "Хранилище подключено из LVM напрямую: ${MOUNTPOINT} -> /media/frigate"
 echo "UI: http://<server>:5000"
-echo
-echo "Проверьте логи:  docker logs -f frigate"
