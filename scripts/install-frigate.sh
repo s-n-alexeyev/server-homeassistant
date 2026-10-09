@@ -108,22 +108,30 @@ for c in lvdisplay blkid mkfs.ext4 mount findmnt docker ffprobe nmap wget; do
   need_cmd "$c"
 done
 
-# === 4. LVM + ФАЙЛОВАЯ СИСТЕМА + МОНТИРОВАНИЕ (АВТООЧИСТКА ДУБЛИКАТОВ) ===
-echo "=== Проверка и очистка старых томов LVM ==="
+# === 4. LVM + ФАЙЛОВАЯ СИСТЕМА + МОНТИРОВАНИЕ (АВТОМАТИЧЕСКАЯ ОЧИСТКА ДУБЛИКАТОВ) ===
+echo "=== Автоматическая проверка и очистка дубликатов LVM и fstab ==="
 
-for old_lv in $(lvs --noheadings -o lv_name $VG_NAME 2>/dev/null | grep -E "frigate-storage" | grep -v "$LV_NAME"); do
-  echo "⚠️ Обнаружен лишний том: $old_lv. Удаляем..."
-  umount -lf "$MOUNTPOINT" 2>/dev/null || true
+# Отмонтируем точку, если она была занята
+umount -lf "$MOUNTPOINT" 2>/dev/null || true
+
+# Автоматически удаляем все старые/лишние логические тома Frigate (например, дубликаты)
+for old_lv in $(lvs --noheadings -o lv_name "$VG_NAME" 2>/dev/null | grep -E "frigate-storage" | grep -v "$LV_NAME"); do
+  echo "⚠️ Найден лишний том LVM: $old_lv. Принудительно удаляем..."
   lvremove -f "$VG_NAME/$old_lv" || true
 done
 
+# Очищаем все старые записи для /opt/frigate/storage в fstab
 if grep -q "$MOUNTPOINT" /etc/fstab; then
   echo "ℹ️ Очищаем старые записи монтирования в /etc/fstab..."
   grep -v "$MOUNTPOINT" /etc/fstab > /etc/fstab.tmp && mv /etc/fstab.tmp /etc/fstab
 fi
 
+# Проверяем основной том
 if lvdisplay "$LV_PATH" >/dev/null 2>&1; then
-  echo "✔ Актуальный том $LV_NAME уже существует."
+  echo "✔ Основной том $LV_NAME уже существует."
+  # Если нужен авто-апдейт размера, можно раскомментировать строку ниже, 
+  # но сейчас оставляем как есть, без лишних вопросов:
+  # lvextend -L +50G -r "$LV_PATH" 2>/dev/null || true
 else
   read -rp "Введите объем создаваемого тома (по умолчанию 100G): " INPUT_SIZE
   SIZE="${INPUT_SIZE:-100G}"
@@ -139,9 +147,9 @@ fi
 mkdir -p "$MOUNTPOINT"
 UUID=$(blkid -s UUID -o value "$LV_PATH")
 
+# Прописываем единственную правильную запись в fstab
 echo "UUID=$UUID $MOUNTPOINT ext4 defaults,nofail 0 2" >> /etc/fstab
 
-umount "$MOUNTPOINT" 2>/dev/null || true
 mount "$MOUNTPOINT"
 
 echo "✔ Storage ready:"
