@@ -113,14 +113,20 @@ for c in lvcreate lvdisplay blkid mkfs.ext4 mount findmnt docker ffprobe nmap wg
   need_cmd "$c"
 done
 
-# === 4. LVM + ФАЙЛОВАЯ СИСТЕМА + МОНТИРОВАНИЕ ===
+# === 4. LVM + ФАЙЛОВАЯ СИСТЕМА + МОНТИРОВАНИЕ (КОНТРОЛЬ ПОЛЬЗОВАТЕЛЯ) ===
 echo "=== Настройка хранилища LVM ==="
 
-# Автоматически очищаем старые/лишние дубликаты томов перед проверкой
-for old_lv in $(lvs --noheadings -o lv_name "$VG_NAME" 2>/dev/null \vert{} grep -E "frigate-storage" \vert{} grep -v "$LV_NAME"); do
-  echo "⚠️ Обнаружен лишний том: $old_lv. Удаляем..."
-  umount -lf "$MOUNTPOINT" 2>/dev/null || true
-  lvremove -f "$VG_NAME/$old_lv" || true
+# Проверка на наличие старых/лишних томов с запросом подтверждения
+for old_lv in $(lvs --noheadings -o lv_name "$VG_NAME" 2>/dev/null | grep -E "frigate-storage" | grep -v "$LV_NAME"); do
+  echo "⚠️ Обнаружен старый/лишний том LVM: $old_lv"
+  read -rp "Удалить этот старый том? [y/N]: " remove_old_choice
+  if [[ "$remove_old_choice" =~ ^[Yy]$ ]]; then
+    umount -lf "$MOUNTPOINT" 2>/dev/null || true
+    lvremove -f "$VG_NAME/$old_lv"
+    echo "✔ Том $old_lv удален."
+  else
+    echo "ℹ️ Пропускаем удаление тома $old_lv."
+  fi
 done
 
 if lvdisplay "$LV_PATH" >/dev/null 2>&1; then
@@ -153,11 +159,20 @@ fi
 mkdir -p "$MOUNTPOINT"
 UUID=$(blkid -s UUID -o value "$LV_PATH")
 
-# Чистим старые дублирующие записи в fstab и прописываем актуальную
-if grep -q "$MOUNTPOINT" /etc/fstab; then
-  grep -v "$MOUNTPOINT" /etc/fstab > /etc/fstab.tmp && mv /etc/fstab.tmp /etc/fstab
+# Контроль дубликатов в fstab с вопросом
+if grep -q "$MOUNTPOINT" /etc/fstab && ! grep -q "$UUID" /etc/fstab; then
+  echo "⚠️ В /etc/fstab обнаружена запись для $MOUNTPOINT с другим UUID."
+  cat /etc/fstab | grep "$MOUNTPOINT"
+  read -rp "Очистить старые записи fstab для этой точки монтирования? [Y/n]: " fix_fstab
+  fix_fstab="${fix_fstab:-Y}"
+  if [[ "$fix_fstab" =~ ^[Yy]$ ]]; then
+    grep -v "$MOUNTPOINT" /etc/fstab > /etc/fstab.tmp && mv /etc/fstab.tmp /etc/fstab
+    echo "UUID=$UUID $MOUNTPOINT ext4 defaults,nofail 0 2" >> /etc/fstab
+    echo "✔ Запись в fstab обновлена."
+  fi
+elif ! grep -q "$UUID" /etc/fstab; then
+  echo "UUID=$UUID $MOUNTPOINT ext4 defaults,nofail 0 2" >> /etc/fstab
 fi
-echo "UUID=$UUID$MOUNTPOINT ext4 defaults,nofail 0 2" >> /etc/fstab
 
 if ! mountpoint -q "$MOUNTPOINT"; then
   mount "$MOUNTPOINT" || true
@@ -177,28 +192,28 @@ if [[ "$CPU_VENDOR" == "AuthenticAMD" ]]; then
     MODEL_PATH="$AMD_MODEL_CACHE/yolov8s_320x320.onnx"
 
     if [ ! -f "$MODEL_PATH" ]; then
-        echo "⬇ Скачиваю архив с моделями YOLOv8 для ROCm (harakas/models)..."
+        echo "⬇ Скачиваю архив с моделями YOLOv8 для ROCm (harakas/models)...[cite: 1]"
         TMP_TAR=$(mktemp /tmp/yolov8_models.XXXXXX.tar.gz)
         if ! wget -q --show-progress -O "$TMP_TAR" \
             "https://github.com/harakas/models/releases/download/yolov8.1-1.1/yolov8.small.models.tar.gz"; then
-            echo "⚠️ Не удалось скачать архив вручную."
-            echo "   Frigate попробует скачать модель сам при старте (DOWNLOAD_YOLOV8=1)."
+            echo "⚠️ Не удалось скачать архив вручную[cite: 1]."
+            echo "   Frigate попробует скачать модель сам при старте (DOWNLOAD_YOLOV8=1)[cite: 1]."
             rm -f "$TMP_TAR"
         else
-            echo "📦 Распаковываю архив..."
+            echo "📦 Распаковываю архив...[cite: 1]"
             tar -xzf "$TMP_TAR" -C "$AMD_MODEL_CACHE"
             rm -f "$TMP_TAR"
 
             if [ -f "$MODEL_PATH" ]; then
-                echo "✔ Модель готова: $MODEL_PATH"
+                echo "✔ Модель готова: $MODEL_PATH[cite: 1]"
                 ls -lh "$AMD_MODEL_CACHE"/labels*.txt 2>/dev/null || true
             else
-                echo "⚠️ Файл yolov8s_320x320.onnx не найден после распаковки."
-                echo "   Frigate попробует скачать модель сам при старте."
+                echo "⚠️ Файл yolov8s_320x320.onnx не найден после распаковки[cite: 1]."
+                echo "   Frigate попробует скачать модель сам при старте[cite: 1]."
             fi
         fi
     else
-        echo "✔ Модель уже существует: $MODEL_PATH"
+        echo "✔ Модель уже существует: $MODEL_PATH[cite: 1]"
     fi
 fi
 
@@ -302,3 +317,189 @@ configure_camera_by_ip() {
     # Выбор протокола
     local PROTOCOL_CHOICE="rtsp"
     if [ -n "$ONVIF_FOUND_PORT" ] && [ -n "$RTSP_FOUND" ]; then
+        local proto_input
+        read -rp "Протокол для $ip [ONVIF/rtsp]: " proto_input
+        PROTOCOL_CHOICE="${proto_input:-onvif}"
+    elif [ -n "$ONVIF_FOUND_PORT" ]; then
+        PROTOCOL_CHOICE="onvif"
+    fi
+
+    if [[ "$PROTOCOL_CHOICE" =~ ^[Oo][Nn][Vv][Ii][Ff]$ ]]; then
+        cat >> "$CONFIG_FILE" <<EOF
+  $CAM_NAME:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: $RTSP_FOUND
+          roles: [detect, record]
+    onvif:
+      host: $ip
+      port: $ONVIF_FOUND_PORT
+      user: "$CAM_USER"
+      password: "$CAM_PASS"
+      autotracking:
+        enabled: false
+    detect:
+      enabled: true
+      width: 1280
+      height: 720
+    objects:
+      track: [person, car]
+    record:
+      enabled: true
+    zones: {}
+    motion:
+      mask: 0,0.037,0.242,0.038,0.242,0,0,0
+EOF
+    else
+        cat >> "$CONFIG_FILE" <<EOF
+  $CAM_NAME:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: $RTSP_FOUND
+          roles: [detect, record]
+    detect:
+      enabled: true
+      width: 1280
+      height: 720
+    objects:
+      track: [person, car]
+    record:
+      enabled: true
+    zones: {}
+    motion:
+      mask: 0,0.037,0.242,0.038,0.242,0,0,0
+EOF
+    fi
+
+    camera_index=$((camera_index+1))
+}
+
+# --- Шапка конфига ---
+cat > "$CONFIG_FILE" <<EOF
+mqtt:
+  enabled: false
+${DETECTORS_BLOCK}
+ffmpeg:
+  hwaccel_args: preset-vaapi
+  output_args:
+    record: preset-record-generic-audio-aac
+${MODEL_BLOCK}
+record:
+  enabled: true
+  continuous:
+    days: 0
+  motion:
+    days: 30
+cameras:
+EOF
+
+# --- Первичное сканирование сети ---
+discovered_ips=()
+if command -v nmap >/dev/null 2>&1; then
+    read -rp "Запустить сканирование сети для поиска камер? [Y/n]: " scan_choice
+    scan_choice="${scan_choice:-Y}"
+    if [[ "$scan_choice" =~ ^[Yy]$ ]]; then
+        echo "=== Сканирование сети ==="
+        mapfile -t discovered_ips < <(scan_network)
+        if [ ${#discovered_ips[@]} -gt 0 ]; then
+            echo "✔ Найдены IP с открытым портом 554: ${discovered_ips[*]}"
+        else
+            echo "⚠️ Устройств с открытым портом 554 не найдено."
+        fi
+    fi
+fi
+
+# --- Обработка камер ---
+camera_index=1
+
+if [ ${#discovered_ips[@]} -gt 0 ]; then
+    echo "=== Настройка найденных камер ==="
+    for ip in "${discovered_ips[@]}"; do
+        configure_camera_by_ip "$ip"
+    done
+else
+    read -rp "Количество камер: " CAMERA_COUNT
+    if ! [[ "$CAMERA_COUNT" =~ ^[0-9]+$ ]] || [ "$CAMERA_COUNT" -le 0 ]; then
+      echo "Нужно минимум 1 камера"
+      exit 1
+    fi
+
+    i=1
+    while [ "$i" -le "$CAMERA_COUNT" ]; do
+      echo; echo "=== Камера $i ==="
+      read -rp "IP: " CAM_IP
+      if [ -z "$CAM_IP" ]; then
+          echo "❌ пропуск (нет IP)"
+          i=$((i+1))
+          continue
+      fi
+      configure_camera_by_ip "$CAM_IP"
+      i=$((i+1))
+    done
+fi
+
+# --- Цикл поиска камер в дополнительных сетях ---
+while true; do
+    echo
+    read -rp "Поискать камеры в другой сети? [y/N]: " more_networks
+    more_networks="${more_networks:-N}"
+    [[ "$more_networks" =~ ^[Yy]$ ]] || break
+
+    read -rp "Введите подсеть (например, 192.168.20.0/24): " user_subnet
+    if [ -z "$user_subnet" ]; then
+        echo "⚠️ Подсеть не указана, пропускаю."
+        continue
+    fi
+
+    echo "=== Сканирование $user_subnet ==="
+    more_ips=()
+    mapfile -t more_ips < <(scan_subnet "$user_subnet")
+    if [ ${#more_ips[@]} -eq 0 ]; then
+        echo "⚠️ Устройств с открытым портом 554 не найдено в $user_subnet."
+        continue
+    fi
+
+    echo "✔ Найдены IP: ${more_ips[*]}"
+    for ip in "${more_ips[@]}"; do
+        configure_camera_by_ip "$ip"
+    done
+done
+
+echo "version: 0.18" >> "$CONFIG_FILE"
+echo "✔ Config ready"
+
+# === 6. СОЗДАНИЕ DOCKER COMPOSE И ЗАПУСК ===
+mkdir -p "$BASE"; cd "$BASE"
+cat > docker-compose.yml <<EOF
+services:
+  frigate:
+    container_name: frigate
+    image: $FRIGATE_IMAGE
+    restart: unless-stopped
+    privileged: true
+    shm_size: "512mb"
+${COMPOSE_DEVICES}
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - ./config:/config
+      - ./storage:/media/frigate
+    ports:
+      - "8971:8971"
+      - "5000:5000"
+      - "8554:8554"
+      - "8555:8555/tcp"
+      - "8555:8555/udp"
+    environment:
+      FRIGATE_RTSP_PASSWORD: "password"
+${EXTRA_ENV}
+EOF
+
+echo "=== Запуск Docker Compose ==="
+docker compose down || true
+docker compose up -d
+echo "✔ ГОТОВО! Используемый образ: $FRIGATE_IMAGE"
+echo "UI: http://<server>:5000"
+echo
+echo "Проверьте логи:  docker logs -f frigate"
