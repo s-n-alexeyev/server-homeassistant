@@ -113,22 +113,35 @@ for c in lvcreate lvdisplay blkid mkfs.ext4 mount findmnt docker ffprobe nmap wg
   need_cmd "$c"
 done
 
-# === 4. LVM + ФАЙЛОВАЯ СИСТЕМА + МОНТИРОВАНИЕ (КОНТРОЛЬ ПОЛЬЗОВАТЕЛЯ) ===
+# === 4. LVM + ФАЙЛОВАЯ СИСТЕМА + МОНТИРОВАНИЕ ===
 echo "=== Настройка хранилища LVM ==="
 
-# Проверка на наличие старых/лишних томов с запросом подтверждения
-for old_lv in $(lvs --noheadings -o lv_name "$VG_NAME" 2>/dev/null | grep -E "frigate-storage" | grep -v "$LV_NAME"); do
-  echo "⚠️ Обнаружен старый/лишний том LVM: $old_lv"
-  read -rp "Удалить этот старый том? [y/N]: " remove_old_choice
-  if [[ "$remove_old_choice" =~ ^[Yy]$ ]]; then
-    umount -lf "$MOUNTPOINT" 2>/dev/null || true
-    lvremove -f "$VG_NAME/$old_lv"
-    echo "✔ Том $old_lv удален."
-  else
-    echo "ℹ️ Пропускаем удаление тома $old_lv."
-  fi
-done
+# Сначала проверяем проблемы (лишние тома / старые записи fstab) с контролем от пользователя
+EXTRA_LVS=$(lvs --noheadings -o lv_name "$VG_NAME" 2>/dev/null | grep -E "frigate-storage" | grep -v "$LV_NAME" || true)
 
+if [ -n "$EXTRA_LVS" ] || grep -q "$MOUNTPOINT" /etc/fstab; then
+  echo "⚠️ Обнаружены потенциальные проблемы с хранилищем:"
+  [ -n "$EXTRA_LVS" ] && echo "   - Лишние тома LVM: $EXTRA_LVS"
+  grep -q "$MOUNTPOINT" /etc/fstab && echo "   - Найдены записи для $MOUNTPOINT в /etc/fstab"
+  
+  read -rp "Хотите очистить старые тома и записи в fstab? [y/N]: " clean_choice
+  clean_choice="${clean_choice:-N}"
+  if [[ "$clean_choice" =~ ^[Yy]$ ]]; then
+    for old_lv in $EXTRA_LVS; do
+      echo "Удаляем лишний том $old_lv..."
+      umount -lf "$MOUNTPOINT" 2>/dev/null || true
+      lvremove -f "$VG_NAME/$old_lv" || true
+    done
+    if grep -q "$MOUNTPOINT" /etc/fstab; then
+      echo "Очищаем старые записи в /etc/fstab..."
+      grep -v "$MOUNTPOINT" /etc/fstab > /etc/fstab.tmp && mv /etc/fstab.tmp /etc/fstab
+    fi
+  else
+    echo "ℹ️ Пропускаем очистку по вашему выбору."
+  fi
+fi
+
+# Штатная проверка основного тома и изменение размера
 if lvdisplay "$LV_PATH" >/dev/null 2>&1; then
   echo "✔ Том $LV_NAME уже существует."
   lvdisplay "$LV_PATH" | grep -E "LV Size"
@@ -158,19 +171,7 @@ fi
 
 mkdir -p "$MOUNTPOINT"
 UUID=$(blkid -s UUID -o value "$LV_PATH")
-
-# Контроль дубликатов в fstab с вопросом
-if grep -q "$MOUNTPOINT" /etc/fstab && ! grep -q "$UUID" /etc/fstab; then
-  echo "⚠️ В /etc/fstab обнаружена запись для $MOUNTPOINT с другим UUID."
-  cat /etc/fstab | grep "$MOUNTPOINT"
-  read -rp "Очистить старые записи fstab для этой точки монтирования? [Y/n]: " fix_fstab
-  fix_fstab="${fix_fstab:-Y}"
-  if [[ "$fix_fstab" =~ ^[Yy]$ ]]; then
-    grep -v "$MOUNTPOINT" /etc/fstab > /etc/fstab.tmp && mv /etc/fstab.tmp /etc/fstab
-    echo "UUID=$UUID $MOUNTPOINT ext4 defaults,nofail 0 2" >> /etc/fstab
-    echo "✔ Запись в fstab обновлена."
-  fi
-elif ! grep -q "$UUID" /etc/fstab; then
+if ! grep -q "$UUID" /etc/fstab; then
   echo "UUID=$UUID $MOUNTPOINT ext4 defaults,nofail 0 2" >> /etc/fstab
 fi
 
@@ -192,28 +193,28 @@ if [[ "$CPU_VENDOR" == "AuthenticAMD" ]]; then
     MODEL_PATH="$AMD_MODEL_CACHE/yolov8s_320x320.onnx"
 
     if [ ! -f "$MODEL_PATH" ]; then
-        echo "⬇ Скачиваю архив с моделями YOLOv8 для ROCm (harakas/models)...[cite: 1]"
+        echo "⬇ Скачиваю архив с моделями YOLOv8 для ROCm (harakas/models)..."
         TMP_TAR=$(mktemp /tmp/yolov8_models.XXXXXX.tar.gz)
         if ! wget -q --show-progress -O "$TMP_TAR" \
             "https://github.com/harakas/models/releases/download/yolov8.1-1.1/yolov8.small.models.tar.gz"; then
-            echo "⚠️ Не удалось скачать архив вручную[cite: 1]."
-            echo "   Frigate попробует скачать модель сам при старте (DOWNLOAD_YOLOV8=1)[cite: 1]."
+            echo "⚠️ Не удалось скачать архив вручную."
+            echo "   Frigate попробует скачать модель сам при старте (DOWNLOAD_YOLOV8=1)."
             rm -f "$TMP_TAR"
         else
-            echo "📦 Распаковываю архив...[cite: 1]"
+            echo "📦 Распаковываю архив..."
             tar -xzf "$TMP_TAR" -C "$AMD_MODEL_CACHE"
             rm -f "$TMP_TAR"
 
             if [ -f "$MODEL_PATH" ]; then
-                echo "✔ Модель готова: $MODEL_PATH[cite: 1]"
+                echo "✔ Модель готова: $MODEL_PATH"
                 ls -lh "$AMD_MODEL_CACHE"/labels*.txt 2>/dev/null || true
             else
-                echo "⚠️ Файл yolov8s_320x320.onnx не найден после распаковки[cite: 1]."
-                echo "   Frigate попробует скачать модель сам при старте[cite: 1]."
+                echo "⚠️ Файл yolov8s_320x320.onnx не найден после распаковки."
+                echo "   Frigate попробует скачать модель сам при старте."
             fi
         fi
     else
-        echo "✔ Модель уже существует: $MODEL_PATH[cite: 1]"
+        echo "✔ Модель уже существует: $MODEL_PATH"
     fi
 fi
 
