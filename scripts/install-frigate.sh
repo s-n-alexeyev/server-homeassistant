@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -uo pipefail
+export LVM_SUPPRESS_FD_WARNINGS=1
 
 # === 1. ПРОВЕРКА И УСТАНОВКА ЗАВИСИМОСТЕЙ ===
 check_and_install() {
@@ -50,7 +51,6 @@ if [[ "$CPU_VENDOR" == "AuthenticAMD" ]]; then
       - /dev/dri:/dev/dri
       - /dev/kfd:/dev/kfd"
 
-    # Frigate 0.18: ROCm работает внутри ONNX-детектора через device: ROCM
     DETECTORS_BLOCK="detectors:
   onnx:
     type: onnx
@@ -66,10 +66,6 @@ if [[ "$CPU_VENDOR" == "AuthenticAMD" ]]; then
   input_pixel_format: bgr
   input_dtype: float"
 
-    # HSA_OVERRIDE_GFX_VERSION: 11.0.0 — RDNA2 (RX 6000, iGPU Ryzen 6000)
-    # RDNA3 (RX 7000, iGPU Ryzen 7000/8000) → 11.0.2
-    # RDNA1 (RX 5000) → 10.1.0
-    # Vega (iGPU Ryzen 2000/3000, RX Vega) → 9.0.0
     EXTRA_ENV="      DOWNLOAD_YOLOV8: \"1\"
       HSA_OVERRIDE_GFX_VERSION: \"11.0.0\"
       LIBVA_DRIVER_NAME: \"radeonsi\""
@@ -116,31 +112,6 @@ done
 # === 4. LVM + ФАЙЛОВАЯ СИСТЕМА + МОНТИРОВАНИЕ ===
 echo "=== Настройка хранилища LVM ==="
 
-# Сначала проверяем проблемы (лишние тома / старые записи fstab) с контролем от пользователя
-EXTRA_LVS=$(lvs --noheadings -o lv_name "$VG_NAME" 2>/dev/null | grep -E "frigate-storage" | grep -v "$LV_NAME" || true)
-
-if [ -n "$EXTRA_LVS" ] || grep -q "$MOUNTPOINT" /etc/fstab; then
-  echo "⚠️ Обнаружены потенциальные проблемы с хранилищем:"
-  [ -n "$EXTRA_LVS" ] && echo "   - Лишние тома LVM: $EXTRA_LVS"
-  grep -q "$MOUNTPOINT" /etc/fstab && echo "   - Найдены записи для $MOUNTPOINT в /etc/fstab"
-  
-  read -rp "Хотите очистить старые тома и записи в fstab? [y/N]: " clean_choice
-  clean_choice="${clean_choice:-N}"
-  if [[ "$clean_choice" =~ ^[Yy]$ ]]; then
-    for old_lv in $EXTRA_LVS; do
-      echo "Удаляем лишний том $old_lv..."
-      umount -lf "$MOUNTPOINT" 2>/dev/null || true
-      lvremove -f "$VG_NAME/$old_lv" || true
-    done
-    if grep -q "$MOUNTPOINT" /etc/fstab; then
-      echo "Очищаем старые записи в /etc/fstab..."
-      grep -v "$MOUNTPOINT" /etc/fstab > /etc/fstab.tmp && mv /etc/fstab.tmp /etc/fstab
-    fi
-  else
-    echo "ℹ️ Пропускаем очистку по вашему выбору."
-  fi
-fi
-
 # Штатная проверка основного тома и изменение размера
 if lvdisplay "$LV_PATH" >/dev/null 2>&1; then
   echo "✔ Том $LV_NAME уже существует."
@@ -171,8 +142,13 @@ fi
 
 mkdir -p "$MOUNTPOINT"
 UUID=$(blkid -s UUID -o value "$LV_PATH")
+
+# Исправленная логика: проверяем fstab по уникальному UUID, а не по пути монтирования
 if ! grep -q "$UUID" /etc/fstab; then
   echo "UUID=$UUID $MOUNTPOINT ext4 defaults,nofail 0 2" >> /etc/fstab
+  echo "✔ Добавлена запись в /etc/fstab"
+else
+  echo "✔ Запись для хранилища уже присутствует в /etc/fstab"
 fi
 
 if ! mountpoint -q "$MOUNTPOINT"; then
@@ -186,7 +162,6 @@ df -h "$MOUNTPOINT" || true
 # === 5. СКАНИРОВАНИЕ СЕТИ И ГЕНЕРАЦИЯ КОНФИГА ===
 mkdir -p "$CONFIG_DIR"
 
-# --- Предзагрузка модели YOLOv8 для AMD ROCm (проверенный источник) ---
 if [[ "$CPU_VENDOR" == "AuthenticAMD" ]]; then
     AMD_MODEL_CACHE="$CONFIG_DIR/model_cache/yolov8"
     mkdir -p "$AMD_MODEL_CACHE"
@@ -198,27 +173,17 @@ if [[ "$CPU_VENDOR" == "AuthenticAMD" ]]; then
         if ! wget -q --show-progress -O "$TMP_TAR" \
             "https://github.com/harakas/models/releases/download/yolov8.1-1.1/yolov8.small.models.tar.gz"; then
             echo "⚠️ Не удалось скачать архив вручную."
-            echo "   Frigate попробует скачать модель сам при старте (DOWNLOAD_YOLOV8=1)."
             rm -f "$TMP_TAR"
         else
             echo "📦 Распаковываю архив..."
             tar -xzf "$TMP_TAR" -C "$AMD_MODEL_CACHE"
             rm -f "$TMP_TAR"
-
-            if [ -f "$MODEL_PATH" ]; then
-                echo "✔ Модель готова: $MODEL_PATH"
-                ls -lh "$AMD_MODEL_CACHE"/labels*.txt 2>/dev/null || true
-            else
-                echo "⚠️ Файл yolov8s_320x320.onnx не найден после распаковки."
-                echo "   Frigate попробует скачать модель сам при старте."
-            fi
         fi
     else
         echo "✔ Модель уже существует: $MODEL_PATH"
     fi
 fi
 
-# --- Вспомогательные функции ---
 scan_subnet() {
     local subnet="$1"
     nmap -p 554 --open -oG - "$subnet" 2>/dev/null | grep "554/open" | awk '{print $2}'
@@ -270,7 +235,6 @@ EOF
   fi
 }
 
-# --- Обработка одной камеры по IP (используется во всех режимах) ---
 configure_camera_by_ip() {
     local ip="$1"
 
@@ -292,7 +256,6 @@ configure_camera_by_ip() {
     read -rsp "Пароль: " CAM_PASS
     echo
 
-    # ONVIF-порты
     local ONVIF_FOUND_PORT=""
     for p in 80 8000 8899; do
         if probe_onvif "$ip" "$p"; then
@@ -301,7 +264,6 @@ configure_camera_by_ip() {
         fi
     done
 
-    # Поиск рабочего RTSP
     local RTSP_FOUND=""
     for cred_pair in "${CAM_USER}:${CAM_PASS}" " : " "admin:admin" "root:root"; do
         local u p
@@ -315,7 +277,6 @@ configure_camera_by_ip() {
     done
     [ -z "$RTSP_FOUND" ] && RTSP_FOUND="rtsp://${CAM_USER:+$CAM_USER${CAM_PASS:+:$CAM_PASS}@}${ip}:554/ch0"
 
-    # Выбор протокола
     local PROTOCOL_CHOICE="rtsp"
     if [ -n "$ONVIF_FOUND_PORT" ] && [ -n "$RTSP_FOUND" ]; then
         local proto_input
@@ -377,7 +338,6 @@ EOF
     camera_index=$((camera_index+1))
 }
 
-# --- Шапка конфига ---
 cat > "$CONFIG_FILE" <<EOF
 mqtt:
   enabled: false
@@ -396,7 +356,6 @@ record:
 cameras:
 EOF
 
-# --- Первичное сканирование сети ---
 discovered_ips=()
 if command -v nmap >/dev/null 2>&1; then
     read -rp "Запустить сканирование сети для поиска камер? [Y/n]: " scan_choice
@@ -412,7 +371,6 @@ if command -v nmap >/dev/null 2>&1; then
     fi
 fi
 
-# --- Обработка камер ---
 camera_index=1
 
 if [ ${#discovered_ips[@]} -gt 0 ]; then
@@ -441,7 +399,6 @@ else
     done
 fi
 
-# --- Цикл поиска камер в дополнительных сетях ---
 while true; do
     echo
     read -rp "Поискать камеры в другой сети? [y/N]: " more_networks
@@ -471,7 +428,6 @@ done
 echo "version: 0.18" >> "$CONFIG_FILE"
 echo "✔ Config ready"
 
-# === 6. СОЗДАНИЕ DOCKER COMPOSE И ЗАПУСК ===
 mkdir -p "$BASE"; cd "$BASE"
 cat > docker-compose.yml <<EOF
 services:
@@ -502,5 +458,3 @@ docker compose down || true
 docker compose up -d
 echo "✔ ГОТОВО! Используемый образ: $FRIGATE_IMAGE"
 echo "UI: http://<server>:5000"
-echo
-echo "Проверьте логи:  docker logs -f frigate"
