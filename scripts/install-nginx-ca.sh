@@ -169,19 +169,45 @@ fi
 
 echo "[+] Создание конфигурации Nginx..."
 $SUDO tee "$CONFIG_PATH" >/dev/null <<EOF
-server {
-    listen 80;
-    server_name $NETBIRD_NAME;
-    return 301 https://\$host\$request_uri;
-}
-
+# 1. SSL-сервер (слушает 443 порт для HTTPS)
 server {
     listen 443 ssl;
+    listen [::]:443 ssl;
+
     server_name $NETBIRD_NAME;
 
-    ssl_certificate     $SSL_CERT;
+    ssl_certificate $SSL_CERT;
     ssl_certificate_key $SSL_KEY;
 
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    client_max_body_size 500m;
+
+    location / {
+        proxy_pass http://$BACKEND_IP:8123;
+
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+
+        proxy_http_version 1.1;
+
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        proxy_buffering off;
+    }
+}
+
+# 2. Обычный сервер (доступ по IP на порту 8123)
+server {
+    listen 8123 default_server;
+    listen [::]:8123 default_server;
+
+    server_name _;
+
+    client_max_body_size 500m;
     location / {
         proxy_pass http://$BACKEND_IP:8123;
         proxy_set_header Host \$host;
@@ -191,6 +217,7 @@ server {
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
+        proxy_buffering off;
     }
 }
 EOF
