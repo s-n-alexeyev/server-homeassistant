@@ -437,6 +437,10 @@ services:
     restart: unless-stopped
     privileged: true
     shm_size: "512mb"
+    ulimits:
+      core:
+        soft: 0
+        hard: 0
 ${COMPOSE_DEVICES}
     volumes:
       - /etc/localtime:/etc/localtime:ro
