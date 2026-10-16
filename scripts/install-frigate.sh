@@ -12,6 +12,8 @@ check_and_install() {
     command -v nmap >/dev/null 2>&1     || to_install+=("nmap")
     command -v docker >/dev/null 2>&1   || to_install+=("docker.io")
     command -v wget >/dev/null 2>&1     || to_install+=("wget")
+    command -v lspci >/dev/null 2>&1    || to_install+=("pciutils")
+    command -v nc >/dev/null 2>&1       || to_install+=("netcat-openbsd")
     if ! docker compose version >/dev/null 2>&1 && ! command -v docker-compose >/dev/null 2>&1; then
         to_install+=("docker-compose-v2")
     fi
@@ -33,7 +35,27 @@ check_and_install() {
 }
 check_and_install
 
-# === 2. ОПРЕДЕЛЕНИЕ АРХИТЕКТУРЫ (AMD ROCm / Intel OpenVINO) ===
+# === 2. ОПРЕДЕЛЕНИЕ МОДЕЛИ GPU ===
+detect_amd_gpu() {
+    local gpu_info
+    gpu_info=$(lspci -nn 2>/dev/null | grep -E 'VGA|3D|Display' | grep -i 'AMD' || true)
+
+    if echo "$gpu_info" | grep -qi 'Phoenix'; then
+        echo "phoenix"
+    elif echo "$gpu_info" | grep -qi 'Renoir'; then
+        echo "renoir"
+    elif echo "$gpu_info" | grep -qiE 'Cezanne|Barcelo|Lucienne'; then
+        echo "cezanne"
+    elif echo "$gpu_info" | grep -qiE 'Raphael|Granite Ridge'; then
+        echo "raphael"
+    elif echo "$gpu_info" | grep -qiE 'Rembrandt'; then
+        echo "rembrandt"
+    else
+        echo "unknown"
+    fi
+}
+
+# === 3. ОПРЕДЕЛЕНИЕ АРХИТЕКТУРЫ (AMD ROCm / Intel OpenVINO) ===
 CPU_VENDOR=$(lscpu | grep "Vendor ID" | awk '{print $3}')
 echo "ℹ️ Обнаружен процессор с вендором: $CPU_VENDOR"
 
@@ -42,22 +64,118 @@ COMPOSE_DEVICES=""
 DETECTORS_BLOCK=""
 MODEL_BLOCK=""
 EXTRA_ENV=""
+AMD_GPU_MODEL=""
+AMD_MODEL_FILE=""
 
 if [[ "$CPU_VENDOR" == "AuthenticAMD" ]]; then
-    echo "✔ Обнаружена платформа AMD. Настраиваем ROCm + ONNX..."
-    FRIGATE_IMAGE="ghcr.io/blakeblackshear/frigate:stable-rocm"
+    AMD_GPU_MODEL=$(detect_amd_gpu)
+    echo "ℹ️ Обнаружена AMD GPU: $AMD_GPU_MODEL"
 
+    # Общие настройки для всех AMD ROCm
     COMPOSE_DEVICES="    devices:
       - /dev/dri:/dev/dri
       - /dev/kfd:/dev/kfd"
 
-    DETECTORS_BLOCK="detectors:
+    AMD_MODEL_CACHE="$CONFIG_DIR/model_cache/yolov8"
+
+    case "$AMD_GPU_MODEL" in
+        phoenix)
+            # Phoenix1 — RDNA3, gfx1103
+            echo "✔ Phoenix1 (RDNA3). Настраиваем ROCm + ONNX..."
+            FRIGATE_IMAGE="ghcr.io/blakeblackshear/frigate:stable-rocm"
+
+            DETECTORS_BLOCK="detectors:
   onnx:
     type: onnx
     device: ROCM"
 
+            EXTRA_ENV="      DOWNLOAD_YOLOV8: \"1\"
+      HSA_OVERRIDE_GFX_VERSION: \"11.0.0\"
+      LIBVA_DRIVER_NAME: \"radeonsi\""
+
+            AMD_MODEL_FILE="yolov8s_320x320.onnx"
+            ;;
+
+        renoir|cezanne|lucienne)
+            # Renoir / Cezanne / Lucienne — Vega, gfx90c
+            echo "✔ Renoir/Cezanne (Vega 6/7/8). Настраиваем ROCm + MIGraphX..."
+            FRIGATE_IMAGE="ghcr.io/garymathews/frigate:latest-rocm-7.2.0"
+
+            DETECTORS_BLOCK="detectors:
+  rocm:
+    type: migraphx
+    device: GPU
+    conserve_cpu: true
+    fast_math: true
+    exhaustive_tune: false"
+
+            EXTRA_ENV="      LIBVA_DRIVER_NAME: \"radeonsi\"
+      HSA_OVERRIDE_GFX_VERSION: \"9.0.0\"
+      HSA_ENABLE_SDMA: \"0\"
+      MIGRAPHX_DISABLE_MIOPEN_FUSION: \"1\""
+
+            AMD_MODEL_FILE="yolov8n_320x320.onnx"
+            ;;
+
+        rembrandt)
+            # Rembrandt — RDNA2, gfx1035
+            echo "✔ Rembrandt (RDNA2). Настраиваем ROCm + ONNX..."
+            FRIGATE_IMAGE="ghcr.io/blakeblackshear/frigate:stable-rocm"
+
+            DETECTORS_BLOCK="detectors:
+  onnx:
+    type: onnx
+    device: ROCM"
+
+            EXTRA_ENV="      DOWNLOAD_YOLOV8: \"1\"
+      HSA_OVERRIDE_GFX_VERSION: \"10.3.0\"
+      LIBVA_DRIVER_NAME: \"radeonsi\""
+
+            AMD_MODEL_FILE="yolov8s_320x320.onnx"
+            ;;
+
+        raphael)
+            # Raphael — RDNA2, gfx1036
+            echo "✔ Raphael (RDNA2). Настраиваем ROCm + ONNX..."
+            FRIGATE_IMAGE="ghcr.io/blakeblackshear/frigate:stable-rocm"
+
+            DETECTORS_BLOCK="detectors:
+  onnx:
+    type: onnx
+    device: ROCM"
+
+            EXTRA_ENV="      DOWNLOAD_YOLOV8: \"1\"
+      HSA_OVERRIDE_GFX_VERSION: \"10.3.0\"
+      LIBVA_DRIVER_NAME: \"radeonsi\""
+
+            AMD_MODEL_FILE="yolov8s_320x320.onnx"
+            ;;
+
+        *)
+            # Неизвестная AMD GPU — используем безопасный профиль Renoir (Vega)
+            echo "⚠️ Неизвестная AMD GPU. Используем конфигурацию по умолчанию (ROCm + MIGraphX, gfx9)..."
+            FRIGATE_IMAGE="ghcr.io/garymathews/frigate:latest-rocm-7.2.0"
+
+            DETECTORS_BLOCK="detectors:
+  rocm:
+    type: migraphx
+    device: GPU
+    conserve_cpu: true
+    fast_math: true
+    exhaustive_tune: false"
+
+            EXTRA_ENV="      LIBVA_DRIVER_NAME: \"radeonsi\"
+      HSA_OVERRIDE_GFX_VERSION: \"9.0.0\"
+      HSA_ENABLE_SDMA: \"0\"
+      MIGRAPHX_DISABLE_MIOPEN_FUSION: \"1\""
+
+            AMD_MODEL_FILE="yolov8n_320x320.onnx"
+            ;;
+    esac
+
+    # Модель для config.yaml
     MODEL_BLOCK="model:
-  path: /config/model_cache/yolov8/yolov8s_320x320.onnx
+  path: /config/model_cache/yolov8/${AMD_MODEL_FILE}
   labelmap_path: /config/model_cache/yolov8/labels.txt
   model_type: yolo-generic
   width: 320
@@ -66,18 +184,18 @@ if [[ "$CPU_VENDOR" == "AuthenticAMD" ]]; then
   input_pixel_format: bgr
   input_dtype: float"
 
-    EXTRA_ENV="      DOWNLOAD_YOLOV8: \"1\"
-      HSA_OVERRIDE_GFX_VERSION: \"11.0.0\"
-      LIBVA_DRIVER_NAME: \"radeonsi\""
 else
     echo "✔ Обнаружена платформа Intel (или совместимая). Настраиваем OpenVINO GPU..."
     FRIGATE_IMAGE="ghcr.io/blakeblackshear/frigate:stable"
+
     COMPOSE_DEVICES="    devices:
       - /dev/dri/renderD128:/dev/dri/renderD128"
+
     DETECTORS_BLOCK="detectors:
   ov:
     type: openvino
     device: GPU"
+
     MODEL_BLOCK="model:
   width: 300
   height: 300
@@ -87,7 +205,7 @@ else
   labelmap_path: /openvino-model/coco_91cl_bkgr.txt"
 fi
 
-# === 3. НАСТРОЙКА ПЕРЕМЕННЫХ ХРАНИЛИЩА ===
+# === 4. НАСТРОЙКА ПЕРЕМЕННЫХ ХРАНИЛИЩА ===
 LV_NAME="frigate-storage"
 VG_NAME="pve"
 THIN_POOL="data"
@@ -109,10 +227,9 @@ for c in lvcreate lvdisplay blkid mkfs.ext4 mount findmnt docker ffprobe nmap wg
   need_cmd "$c"
 done
 
-# === 4. LVM + ФАЙЛОВАЯ СИСТЕМА + МОНТИРОВАНИЕ ===
+# === 5. LVM + ФАЙЛОВАЯ СИСТЕМА + МОНТИРОВАНИЕ ===
 echo "=== Настройка хранилища LVM ==="
 
-# Штатная проверка основного тома и изменение размера
 if lvdisplay "$LV_PATH" >/dev/null 2>&1; then
   echo "✔ Том $LV_NAME уже существует."
   lvdisplay "$LV_PATH" | grep -E "LV Size"
@@ -143,7 +260,6 @@ fi
 mkdir -p "$MOUNTPOINT"
 UUID=$(blkid -s UUID -o value "$LV_PATH")
 
-# Исправленная логика: проверяем fstab по уникальному UUID, а не по пути монтирования
 if ! grep -q "$UUID" /etc/fstab; then
   echo "UUID=$UUID $MOUNTPOINT ext4 defaults,nofail 0 2" >> /etc/fstab
   echo "✔ Добавлена запись в /etc/fstab"
@@ -159,13 +275,14 @@ echo "✔ Storage ready:"
 findmnt "$MOUNTPOINT" || true
 df -h "$MOUNTPOINT" || true
 
-# === 5. СКАНИРОВАНИЕ СЕТИ И ГЕНЕРАЦИЯ КОНФИГА ===
+# === 6. СКАНИРОВАНИЕ СЕТИ И ГЕНЕРАЦИЯ КОНФИГА ===
 mkdir -p "$CONFIG_DIR"
 
+# Скачивание модели YOLOv8 для AMD
 if [[ "$CPU_VENDOR" == "AuthenticAMD" ]]; then
     AMD_MODEL_CACHE="$CONFIG_DIR/model_cache/yolov8"
     mkdir -p "$AMD_MODEL_CACHE"
-    MODEL_PATH="$AMD_MODEL_CACHE/yolov8s_320x320.onnx"
+    MODEL_PATH="$AMD_MODEL_CACHE/${AMD_MODEL_FILE}"
 
     if [ ! -f "$MODEL_PATH" ]; then
         echo "⬇ Скачиваю архив с моделями YOLOv8 для ROCm (harakas/models)..."
@@ -178,6 +295,24 @@ if [[ "$CPU_VENDOR" == "AuthenticAMD" ]]; then
             echo "📦 Распаковываю архив..."
             tar -xzf "$TMP_TAR" -C "$AMD_MODEL_CACHE"
             rm -f "$TMP_TAR"
+
+            # Если распакованные имена отличаются — переименуем под ожидаемое
+            if [ ! -f "$MODEL_PATH" ]; then
+                shopt -s nullglob
+                for f in "$AMD_MODEL_CACHE"/*.onnx; do
+                    base=$(basename "$f")
+                    # Приводим типовые имена к нужному
+                    if [[ "$AMD_MODEL_FILE" == "yolov8n_320x320.onnx" && "$base" == *yolov8n*320*.onnx ]]; then
+                        mv "$f" "$MODEL_PATH"
+                        break
+                    fi
+                    if [[ "$AMD_MODEL_FILE" == "yolov8s_320x320.onnx" && "$base" == *yolov8s*320*.onnx ]]; then
+                        mv "$f" "$MODEL_PATH"
+                        break
+                    fi
+                done
+                shopt -u nullglob
+            fi
         fi
     else
         echo "✔ Модель уже существует: $MODEL_PATH"
@@ -381,7 +516,7 @@ if [ ${#discovered_ips[@]} -gt 0 ]; then
 else
     read -rp "Количество камер: " CAMERA_COUNT
     if ! [[ "$CAMERA_COUNT" =~ ^[0-9]+$ ]] || [ "$CAMERA_COUNT" -le 0 ]; then
-      echo "Нужно минимум 1 камера"
+      echo "❌ Нужно минимум 1 камера"
       exit 1
     fi
 
