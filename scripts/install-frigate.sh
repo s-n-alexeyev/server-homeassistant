@@ -76,8 +76,6 @@ if [[ "$CPU_VENDOR" == "AuthenticAMD" ]]; then
       - /dev/dri:/dev/dri
       - /dev/kfd:/dev/kfd"
 
-    AMD_MODEL_CACHE="$CONFIG_DIR/model_cache/yolov8"
-
     case "$AMD_GPU_MODEL" in
         phoenix)
             # Phoenix1 — RDNA3, gfx1103
@@ -301,7 +299,6 @@ if [[ "$CPU_VENDOR" == "AuthenticAMD" ]]; then
                 shopt -s nullglob
                 for f in "$AMD_MODEL_CACHE"/*.onnx; do
                     base=$(basename "$f")
-                    # Приводим типовые имена к нужному
                     if [[ "$AMD_MODEL_FILE" == "yolov8n_320x320.onnx" && "$base" == *yolov8n*320*.onnx ]]; then
                         mv "$f" "$MODEL_PATH"
                         break
